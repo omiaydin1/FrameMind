@@ -1,31 +1,11 @@
-{
-  "miniapp": {
-    "version": "1",
-    "name": "FrameMind Insights",
-    "iconUrl": "https://usdozf7pplhxfvrl.public.blob.vercel-storage.com/thumbnail_1c8585c3-fbb8-42f5-91c3-268c21c152ba-rROkdbVdfCcO8qyFCxYheRr0LUUcQT",
-    "homeUrl": "https://laugh-house-760.app.ohara.ai",
-    "imageUrl": "https://usdozf7pplhxfvrl.public.blob.vercel-storage.com/thumbnail_1c8585c3-fbb8-42f5-91c3-268c21c152ba-rROkdbVdfCcO8qyFCxYheRr0LUUcQT",
-    "buttonTitle": "Open with Ohara",
-    "splashImageUrl": "https://usdozf7pplhxfvrl.public.blob.vercel-storage.com/farcaster/splash_images/splash_image1.svg",
-    "splashBackgroundColor": "#ffffff",
-    "tags": [
-      "ohara",
-      "mini-app",
-      "base",
-      "farcaster"
-    ],
-    "primaryCategory": "entertainment",
-    "ogTitle": "FrameMind Insights",
-    "ogImageUrl": "https://usdozf7pplhxfvrl.public.blob.vercel-storage.com/thumbnail_1c8585c3-fbb8-42f5-91c3-268c21c152ba-rROkdbVdfCcO8qyFCxYheRr0LUUcQT"
-  },
-  "baseBuilder": {
-    "allowedAddresses": [
-      ""
-    ]
-  },
-  "accountAssociation": {
-    "header": "eyJmaWQiOjEzNTY2NjIsInR5cGUiOiJhdXRoIiwia2V5IjoiMHgxNTUwQjBGRmY1NUVjMDU0NDgwMjREOTYxNmI5RDFFOTk5YTQ3RWYzIn0",
-    "payload": "eyJkb21haW4iOiJsYXVnaC1ob3VzZS03NjAuYXBwLm9oYXJhLmFpIn0",
-    "signature": "L6mt2sRnsEtm+Kwtqct3UKZ0WK2u/oxlOOZ925wGHwN+O1FOJVNj7QyyQ3HuRs6eUrGK4T8642nvjtE3GNbcgxs="
-  }
-}
+/.next
+/node_modules
+
+.DS_Store
+next.log
+.vercel
+
+output.log
+error.log
+
+core
