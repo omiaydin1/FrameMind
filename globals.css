@@ -1,0 +1,434 @@
+use spacetimedb::{table, reducer, ReducerContext, Identity, Table, Timestamp, ScheduleAt};
+use std::time::Duration;
+
+// --- Table Definitions ---
+
+#[table(name = territory, public)]
+#[derive(Clone)]
+pub struct Territory {
+    #[primary_key]
+    #[auto_inc]
+    territory_id: u64,
+    #[index(btree)]
+    owner_identity: Identity,      // Link to user identity for accounting
+    owner: String,                 // Display label: wallet address or Farcaster username
+    latitude: f64,                 // Degrees
+    longitude: f64,                // Degrees
+    radius: f32,                   // Meters
+    color: String,                 // e.g., "#FF00FF" or "magenta"
+    mint_timestamp: Timestamp,
+    price_paid: u64,               // Smallest unit (e.g., wei, cents)
+}
+
+#[table(name = walker, public)]
+#[derive(Clone)]
+pub struct Walker {
+    #[primary_key]
+    walker_id: u64,
+    current_latitude: f64,      // Degrees
+    current_longitude: f64,     // Degrees
+    current_territory_id: u64,  // 0 means not in any territory
+    speed: f32,                 // Meters per second
+    last_update_timestamp: Timestamp,
+}
+
+#[table(name = user_profile, public)]
+#[derive(Clone)]
+pub struct UserProfile {
+    #[primary_key]
+    user_id: Identity,
+    wallet_address: String,
+    username: String,
+    total_territories_minted: u32, // Currently owned territories
+    total_area_claimed: f64,       // Square meters
+    achievement_badges: String,    // JSON array string
+}
+
+#[table(name = game_tick_schedule, public, scheduled(game_tick))]
+pub struct GameTickSchedule {
+    #[primary_key]
+    #[auto_inc]
+    scheduled_id: u64,
+    scheduled_at: ScheduleAt,
+}
+
+// --- Lifecycle Reducers ---
+
+#[reducer(init)]
+pub fn init(ctx: &ReducerContext) -> Result<(), String> {
+    spacetimedb::log::info!("Initializing territory minting module...");
+
+    // Ensure a single walker exists
+    if ctx.db.walker().count() == 0 {
+        let w = Walker {
+            walker_id: 1,
+            current_latitude: 0.0,
+            current_longitude: 0.0,
+            current_territory_id: 0,
+            speed: 50.0, // meters per second
+            last_update_timestamp: ctx.timestamp,
+        };
+        match ctx.db.walker().try_insert(w) {
+            Ok(row) => spacetimedb::log::info!("Initialized walker with id {}", row.walker_id),
+            Err(e) => spacetimedb::log::error!("Failed to initialize walker: {}", e),
+        }
+    }
+
+    // Ensure game tick is scheduled (1s interval)
+    if ctx.db.game_tick_schedule().count() == 0 {
+        let schedule = GameTickSchedule {
+            scheduled_id: 0,
+            scheduled_at: ScheduleAt::Interval(Duration::from_secs(1).into()),
+        };
+        match ctx.db.game_tick_schedule().try_insert(schedule) {
+            Ok(row) => spacetimedb::log::info!("Scheduled game tick with id {}", row.scheduled_id),
+            Err(e) => spacetimedb::log::error!("Failed to schedule game tick: {}", e),
+        }
+    }
+
+    Ok(())
+}
+
+#[reducer(client_connected)]
+pub fn identity_connected(ctx: &ReducerContext) {
+    spacetimedb::log::info!("Client connected: {}", ctx.sender);
+}
+
+#[reducer(client_disconnected)]
+pub fn identity_disconnected(ctx: &ReducerContext) {
+    spacetimedb::log::info!("Client disconnected: {}", ctx.sender);
+}
+
+// --- Reducers ---
+
+// 1) Mint a new territory if it doesn't significantly overlap with existing territories
+#[reducer]
+pub fn mint_territory(
+    ctx: &ReducerContext,
+    latitude: f64,
+    longitude: f64,
+    radius: f32,      // meters
+    color: String,
+    price_paid: u64,
+) -> Result<(), String> {
+    // Validate inputs
+    if !(latitude.is_finite() && longitude.is_finite() && radius.is_finite() && radius > 0.0) {
+        return Err("Invalid mint parameters".into());
+    }
+    if latitude < -85.0 || latitude > 85.0 {
+        return Err("Latitude out of allowed bounds (-85..85)".into());
+    }
+    if longitude < -180.0 || longitude > 180.0 {
+        return Err("Longitude out of bounds (-180..180)".into());
+    }
+
+    // Enforce minimal non-overlap using center distance vs sum of radii
+    // Consider "significant overlap" if centers closer than 90% of sum of radii
+    let overlap_factor: f64 = 0.9;
+    let new_r_m = radius as f64;
+    for t in ctx.db.territory().iter() {
+        let dist = haversine_meters(latitude, longitude, t.latitude, t.longitude);
+        if dist < overlap_factor * (new_r_m + t.radius as f64) {
+            let msg = format!(
+                "Territory overlaps too much with territory {} (distance {:.2} m < {:.2} m)",
+                t.territory_id,
+                dist,
+                overlap_factor * (new_r_m + t.radius as f64)
+            );
+            spacetimedb::log::warn!("{}", msg);
+            return Err(msg);
+        }
+    }
+
+    // Ensure user profile exists
+    ensure_user_profile(ctx, ctx.sender);
+
+    // Determine owner label from profile, falling back to identity string
+    let owner_label = {
+        if let Some(profile) = ctx.db.user_profile().user_id().find(&ctx.sender) {
+            if !profile.username.is_empty() {
+                profile.username.clone()
+            } else if !profile.wallet_address.is_empty() {
+                profile.wallet_address.clone()
+            } else {
+                format!("{}", ctx.sender)
+            }
+        } else {
+            format!("{}", ctx.sender)
+        }
+    };
+
+    let lat = latitude;
+    let lon = longitude;
+
+    let to_insert = Territory {
+        territory_id: 0, // auto_inc
+        owner_identity: ctx.sender,
+        owner: owner_label.clone(),
+        latitude: lat,
+        longitude: lon,
+        radius,
+        color: color.clone(),
+        mint_timestamp: ctx.timestamp,
+        price_paid,
+    };
+
+    match ctx.db.territory().try_insert(to_insert) {
+        Ok(inserted) => {
+            let new_id = inserted.territory_id;
+            spacetimedb::log::info!(
+                "Minted territory {} at ({:.5},{:.5}) r={:.1}m by {}",
+                new_id,
+                lat,
+                lon,
+                radius,
+                owner_label
+            );
+            // Recalculate stats for owner
+            recalc_user_stats(ctx, ctx.sender);
+            Ok(())
+        }
+        Err(e) => {
+            let msg = format!("Failed to mint territory: {}", e);
+            spacetimedb::log::error!("{}", msg);
+            Err(msg)
+        }
+    }
+}
+
+// 2) Move the walker deterministically and update which territory it's in
+#[reducer]
+pub fn update_walker_position(ctx: &ReducerContext) -> Result<(), String> {
+    if let Some(mut w) = ctx.db.walker().walker_id().find(&1u64) {
+        let current_micros = ctx.timestamp.to_micros_since_unix_epoch();
+        let last_micros = w.last_update_timestamp.to_micros_since_unix_epoch();
+        let dt_sec = ((current_micros - last_micros) as f64 / 1_000_000.0).max(0.0);
+
+        if dt_sec > 0.0 {
+            let speed = w.speed as f64; // m/s
+            // Deterministic heading based on absolute time
+            // One full rotation every 10 minutes (600s)
+            let t_abs = current_micros as f64 / 1_000_000.0;
+            let period = 600.0;
+            let heading = 2.0 * std::f64::consts::PI * ((t_abs / period) % 1.0);
+
+            let distance = speed * dt_sec;
+            let d_north = distance * heading.sin(); // meters
+            let d_east = distance * heading.cos();  // meters
+
+            let (new_lat, new_lon) =
+                move_latlon_meters(w.current_latitude, w.current_longitude, d_north, d_east);
+
+            w.current_latitude = clamp_lat(new_lat);
+            w.current_longitude = wrap_lon(new_lon);
+            w.last_update_timestamp = ctx.timestamp;
+
+            // Determine current territory
+            let mut chosen_id: u64 = 0;
+            let mut best_margin = f64::MAX;
+            for t in ctx.db.territory().iter() {
+                let dist = haversine_meters(w.current_latitude, w.current_longitude, t.latitude, t.longitude);
+                let margin = dist - t.radius as f64;
+                if margin <= 0.0 && margin < best_margin {
+                    best_margin = margin;
+                    chosen_id = t.territory_id;
+                }
+            }
+            w.current_territory_id = chosen_id;
+
+            let updated_id = w.walker_id;
+            ctx.db.walker().walker_id().update(w);
+            spacetimedb::log::debug!(
+                "Walker {} moved; now at ({:.5},{:.5}) in territory {}",
+                updated_id,
+                clamp_lat(new_lat),
+                wrap_lon(new_lon),
+                chosen_id
+            );
+        }
+
+        Ok(())
+    } else {
+        Err("Walker not found".into())
+    }
+}
+
+// 3) Fetch territories for a specific user (data via table subscription)
+#[reducer]
+pub fn get_user_territories(_ctx: &ReducerContext, _user_id: Identity) -> Result<(), String> {
+    // No-op: Clients should subscribe to `territory` where owner_identity = user_id
+    Ok(())
+}
+
+// 4) Fetch all territories (data via table subscription)
+#[reducer]
+pub fn get_all_territories(_ctx: &ReducerContext) -> Result<(), String> {
+    // No-op: Clients should subscribe to public `territory` table
+    Ok(())
+}
+
+// 5) Transfer territory ownership
+#[reducer]
+pub fn transfer_territory(
+    ctx: &ReducerContext,
+    territory_id: u64,
+    new_owner_identity: Identity,
+    new_owner_label: String,
+) -> Result<(), String> {
+    // Fetch territory
+    if let Some(mut t) = ctx.db.territory().territory_id().find(&territory_id) {
+        // Only current owner may transfer
+        if t.owner_identity != ctx.sender {
+            return Err("Only the current owner may transfer this territory".into());
+        }
+
+        let prev_owner = t.owner_identity;
+        // Ensure new owner's profile exists
+        ensure_user_profile(ctx, new_owner_identity);
+
+        // Update territory ownership
+        t.owner_identity = new_owner_identity;
+        t.owner = new_owner_label.clone();
+
+        // Store values before move (for logging)
+        let log_territory_id = t.territory_id;
+        let log_new_owner = t.owner.clone();
+
+        ctx.db.territory().territory_id().update(t);
+
+        // Recalculate stats for both parties
+        recalc_user_stats(ctx, prev_owner);
+        recalc_user_stats(ctx, new_owner_identity);
+
+        spacetimedb::log::info!(
+            "Transferred territory {} to {}",
+            log_territory_id,
+            log_new_owner
+        );
+
+        Ok(())
+    } else {
+        Err(format!("Territory {} not found", territory_id))
+    }
+}
+
+// Scheduled tick to drive walker updates deterministically
+#[reducer]
+pub fn game_tick(ctx: &ReducerContext, _tick: GameTickSchedule) -> Result<(), String> {
+    // Only scheduler may call this reducer
+    if ctx.sender != ctx.identity() {
+        return Err("Reducer 'game_tick' may only be invoked by scheduler".into());
+    }
+    // Update walker position
+    let _ = update_walker_position(ctx);
+    Ok(())
+}
+
+// --- Helpers ---
+
+fn ensure_user_profile(ctx: &ReducerContext, user_id: Identity) {
+    if ctx.db.user_profile().user_id().find(&user_id).is_none() {
+        let profile = UserProfile {
+            user_id,
+            wallet_address: String::new(),
+            username: String::new(),
+            total_territories_minted: 0,
+            total_area_claimed: 0.0,
+            achievement_badges: "[]".to_string(),
+        };
+        if let Err(e) = ctx.db.user_profile().try_insert(profile) {
+            spacetimedb::log::error!("Failed to insert user profile: {}", e);
+        }
+    }
+}
+
+fn recalc_user_stats(ctx: &ReducerContext, user_id: Identity) {
+    let mut count: u32 = 0;
+    let mut area_m2: f64 = 0.0;
+    for t in ctx.db.territory().iter() {
+        if t.owner_identity == user_id {
+            count = count.saturating_add(1);
+            let r = t.radius as f64;
+            area_m2 += std::f64::consts::PI * r * r;
+        }
+    }
+
+    if let Some(mut p) = ctx.db.user_profile().user_id().find(&user_id) {
+        p.total_territories_minted = count;
+        p.total_area_claimed = area_m2;
+
+        // Simple badge logic
+        let mut badges: Vec<&str> = Vec::new();
+        if count >= 1 {
+            badges.push("Pioneer");
+        }
+        if count >= 10 {
+            badges.push("Land Baron");
+        }
+        if area_m2 >= 1_000_000.0 {
+            badges.push("Big Footprint");
+        }
+        p.achievement_badges = to_json_array(&badges);
+
+        // Store before move for logging
+        let log_count = p.total_territories_minted;
+        let log_area = p.total_area_claimed;
+
+        ctx.db.user_profile().user_id().update(p);
+        spacetimedb::log::debug!(
+            "Recalculated stats for {}: territories={}, area={:.2} m^2",
+            user_id,
+            log_count,
+            log_area
+        );
+    }
+}
+
+fn to_json_array(items: &[&str]) -> String {
+    let mut out = String::from("[");
+    for (i, s) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        // Escape quotes if needed (simple approach)
+        out.push_str(&s.replace('"', "\\\""));
+        out.push('"');
+    }
+    out.push(']');
+    out
+}
+
+fn clamp_lat(lat: f64) -> f64 {
+    lat.max(-85.0).min(85.0)
+}
+
+fn wrap_lon(lon: f64) -> f64 {
+    let mut x = lon;
+    while x <= -180.0 {
+        x += 360.0;
+    }
+    while x > 180.0 {
+        x -= 360.0;
+    }
+    x
+}
+
+// Move from (lat, lon) by d_north and d_east meters, return new (lat, lon)
+fn move_latlon_meters(lat: f64, lon: f64, d_north: f64, d_east: f64) -> (f64, f64) {
+    const R: f64 = 6_371_000.0; // Earth radius meters
+    let dlat = (d_north / R) * (180.0 / std::f64::consts::PI);
+    let dlon = (d_east / (R * (lat.to_radians().cos().max(1e-8)))) * (180.0 / std::f64::consts::PI);
+    (lat + dlat, lon + dlon)
+}
+
+// Haversine distance in meters
+fn haversine_meters(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const R: f64 = 6_371_000.0;
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let a = (dlat / 2.0).sin().powi(2)
+        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+    R * c
+}
